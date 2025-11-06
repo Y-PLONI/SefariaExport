@@ -106,7 +106,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt -c constraints-ci.txt
 
-      - name: Fallback: replace google-re2 with built-google-re2 (if previous step failed)
+      - name: Fallback replace google-re2 with built-google-re2 (if previous step failed)
         if: ${{ steps.pip_install.outcome == 'failure' }}
         working-directory: Sefaria-Project
         run: |
