@@ -1,4 +1,4 @@
-name: Python 3.9 + MongoDB + Sefaria Export (Matrix + Merge, fast aria2c)
+name: Python 3.9 + MongoDB + Sefaria Export (Matrix + Merge, zstd -19 -T0)
 
 on:
   workflow_dispatch:
@@ -117,10 +117,10 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-
 
-      - name: Install system helpers (wget, zip, nc)
+      - name: Install system helpers (wget, zstd, tar, nc)
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget ca-certificates zip unzip netcat-openbsd
+          sudo apt-get install -y wget ca-certificates zstd tar netcat-openbsd
 
       - name: Install MongoDB Database Tools (mongorestore)
         run: |
@@ -246,7 +246,7 @@ jobs:
             "export_toc": ex.export_toc,
           }
           if fn not in allowed:
-              raise SystemExit(f"Unknown/disabled export function: {fn}")
+            raise SystemExit(f"Unknown/disabled export function: {fn}")
           allowed[fn]()
           print(f"✅ {fn} completed successfully.")
           PY
@@ -264,20 +264,21 @@ jobs:
           echo "Disk usage after cleanup:"
           df -h
 
-      - name: Zip export (no split at this stage)
+      - name: Pack export as tar.zst (-19 -T0)
         run: |
           cd "$SEFARIA_EXPORT_BASE"
-          ZIP_BASE="sefaria-${{ matrix.export_function }}-${TS_STAMP}"
-          zip -r "${ZIP_BASE}.zip" "${{ matrix.export_function }}"
-          echo "ZIP_DIR=$(pwd)" >> $GITHUB_ENV
-          echo "ZIP_BASE=${ZIP_BASE}" >> $GITHUB_ENV
-          ls -lh "$(pwd)/${ZIP_BASE}.zip" || true
+          TARBALL="sefaria-${{ matrix.export_function }}-${TS_STAMP}.tar.zst"
+          # Crée un tar et compresse avec zstd niveau 19, threads auto
+          tar -cf - "${{ matrix.export_function }}" | zstd -19 -T0 -o "${TARBALL}"
+          echo "PKG_DIR=$(pwd)" >> $GITHUB_ENV
+          echo "TARBALL=${TARBALL}" >> $GITHUB_ENV
+          ls -lh "${TARBALL}" || true
 
-      - name: Upload zip as artifact
+      - name: Upload tar.zst as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.export_function }}-${{ env.TS_STAMP }}
-          path: ${{ env.ZIP_DIR }}/${{ env.ZIP_BASE }}.zip
+          path: ${{ env.PKG_DIR }}/${{ env.TARBALL }}
 
   merge_and_split:
     name: Merge all exports then split <2GB
@@ -286,45 +287,49 @@ jobs:
     env:
       TS_STAMP: ${{ needs.prep.outputs.stamp }}
     steps:
-      - name: Install unzip/zip
+      - name: Install zstd, tar, coreutils
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip zip
+          sudo apt-get install -y zstd tar coreutils
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: downloads
 
-      - name: Unzip all exports into one folder
+      - name: Decompress all *.tar.zst into one folder
         run: |
           mkdir -p merged/all
-          find downloads -type f -name '*.zip' -print0 | while IFS=read -r -d '' z; do
-            echo "🔽 Unzipping: $z"
-            unzip -q -o "$z" -d merged/all
+          find downloads -type f -name '*.tar.zst' -print0 | while IFS= read -r -d '' f; do
+            echo "🔽 Extracting: $f"
+            # Méthode robuste via pipe (compatible toutes versions)
+            unzstd -c "$f" | tar -xf - -C merged/all
           done
           echo "Merged tree (top level):"
           find merged -maxdepth 2 -mindepth 1 -type d -print | sed -e 's/^/  /'
 
-      - name: Make final split zip (<2GB parts)
+      - name: Create combined tar.zst (-19 -T0) and split to <2GB parts
         run: |
           cd merged
-          FINAL_BASE="sefaria-ALL-${TS_STAMP}"
-          zip -r -s 1900m "${FINAL_BASE}.zip" "all"
+          FINAL_BASE="sefaria-ALL-${TS_STAMP}.tar.zst"
+          # tar -> zstd (niveau 19, threads auto)
+          tar -cf - "all" | zstd -19 -T0 -o "${FINAL_BASE}"
+          # Split en parts < 2GB (ici 1900m ~ 1.9 GiB)
+          split -b 1900m -d -a 3 "${FINAL_BASE}" "${FINAL_BASE}.part-"
           echo "FINAL_DIR=$(pwd)" >> $GITHUB_ENV
           echo "FINAL_BASE=${FINAL_BASE}" >> $GITHUB_ENV
-          ls -1 "${FINAL_BASE}.zip" "${FINAL_BASE}".z* 2>/dev/null | sort -V || true
+          ls -lh "${FINAL_BASE}" "${FINAL_BASE}.part-"* 2>/dev/null || true
 
-      - name: Upload final split zip as artifact
+      - name: Upload combined parts as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ALL-${{ env.TS_STAMP }}
           path: |
-            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}.zip
-            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}.z*
+            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}
+            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}.part-*
 
   release:
-    name: Create GitHub Release (attach all zips)
+    name: Create GitHub Release (attach all artifacts)
     runs-on: ubuntu-latest
     needs: [prep, export, merge_and_split]
     steps:
@@ -333,39 +338,36 @@ jobs:
         with:
           path: downloads
 
-      - name: Collect parts list for release
-        id: parts
+      - name: Collect files for release
+        id: files
         run: |
           cd downloads
           {
             echo 'files<<EOF'
-            find "$(pwd)" -type f \( -name '*.zip' -o -name '*.z*' \) | sort -V
+            # Inclure les tarballs individuels et les parts combinées
+            find "$(pwd)" -type f \( -name '*.tar.zst' -o -name '*.tar.zst.part-*' \) | sort -V
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
-          echo "Parts to upload:"
-          find "$(pwd)" -type f \( -name '*.zip' -o -name '*.z*' \) | sort -V
 
-      - name: Create GitHub Release with all parts
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prep.outputs.stamp }}
           name: ${{ needs.prep.outputs.stamp }}
-          files: ${{ steps.parts.outputs.files }}
+          files: ${{ steps.files.outputs.files }}
           body: |
             Automated Sefaria exports generated at ${{ env.TZ_NAME }} time: ${{ needs.prep.outputs.stamp }}.
 
-            Included exports (individual zips):
-              - export_all_merged
-              - export_links
-              - export_schemas
-              - export_toc
+            Included artifacts (zstd -19 -T0):
+              - Per-export archives: *.tar.zst (one per export function)
+              - Combined archive split: sefaria-ALL-*.tar.zst + *.tar.zst.part-000, part-001, ...
 
-            Also included:
-              - Combined archive (sefaria-ALL-*.zip + .z01, .z02, ...) with all exports merged
+            To restore a per-export archive:
+              - tar --zstd -xf <name>.tar.zst
+              - (or) unzstd -c <name>.tar.zst | tar -xf -
 
-            To extract split archives:
-              - Keep all parts (.zip and .z01, .z02, ...) in the same folder.
-              - macOS/Linux: unzip <name>.zip
-              - Windows (Explorer/7-Zip): open <name>.zip with all parts present.
+            To restore the combined archive:
+              - cat sefaria-ALL-*.tar.zst.part-* > sefaria-ALL.tar.zst
+              - tar --zstd -xf sefaria-ALL.tar.zst
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
