@@ -285,6 +285,10 @@ jobs:
     needs: [prep, export]
     timeout-minutes: 60
     steps:
+      # CORRECTION: Ajout de l'étape checkout nécessaire pour le contexte git
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all per-export artifacts
         uses: actions/download-artifact@v4
         with:
