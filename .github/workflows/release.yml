@@ -172,6 +172,11 @@ jobs:
           PY
           echo "✅ Mongo restore complete."
 
+          # Cleanup downloaded dump to free space
+          echo "🧹 Cleaning up downloaded dump..."
+          rm -rf dump_small.tar.gz mongo_dump
+          echo "✅ Mongo restore complete and dump cleaned."
+
 
       - name: Run export function
         working-directory: Sefaria-Project
