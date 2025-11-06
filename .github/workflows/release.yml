@@ -1,4 +1,4 @@
-name: Python 3.9 + MongoDB + Sefaria Export (Manual, fast aria2c)
+name: Python 3.9 + MongoDB + Sefaria Export → Push to Repo
 
 on:
   workflow_dispatch:
@@ -42,6 +42,8 @@ jobs:
     steps:
       - name: Checkout (this repository)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed so we can create & push a new branch
 
       - name: Set up Python 3.9
         uses: actions/setup-python@v5
@@ -79,7 +81,7 @@ jobs:
           git clone --depth 1 https://github.com/Sefaria/Sefaria-Project.git
           ls -la Sefaria-Project
 
-      # Handle google-re2 build gracefully
+      # Handle google-re2 build gracefully (avoid Bazel path)
       - name: Install system build deps for google-re2
         run: |
           sudo apt-get update
@@ -107,7 +109,7 @@ jobs:
           pip install -r req-no-re2.txt
           pip install built-google-re2
 
-      - name: Create minimal local_settings.py for CI (sets SEFARIA_DB!)
+      - name: Create minimal local_settings.py for CI (sets SEFARIA_DB)
         working-directory: Sefaria-Project/sefaria
         run: |
           cp local_settings_example.py local_settings.py
@@ -148,18 +150,17 @@ jobs:
           echo "Dump tree:"
           find mongo_dump -maxdepth 3 | sed -e 's/^/  /'
 
-      - name: Restore database from dump_small (detect correct dir) + create empty history
+      - name: Restore database from dump_small (detect dir) + create empty history + cleanup dump
         run: |
-          # Find the folder that directly contains the 'sefaria' DB dump
-          # Common layouts: mongo_dump/dump/sefaria or mongo_dump/sefaria
+          # Locate directory holding 'sefaria' DB dump
           DUMP_DIR="$( \
             if [ -d mongo_dump/dump/sefaria ]; then echo mongo_dump/dump; \
             elif [ -d mongo_dump/sefaria ]; then echo mongo_dump; \
             else echo mongo_dump; fi )"
           echo "Using dump dir: $DUMP_DIR"
-          # Restore only the 'sefaria' database from that directory
+          # Restore only the 'sefaria' database
           mongorestore --host 127.0.0.1 --port 27017 --drop --db sefaria "$DUMP_DIR/sefaria"
-          # Create empty 'history' collection (dump_small requires it)
+          # Ensure an empty 'history' collection (required for dump_small)
           python - <<'PY'
           from pymongo import MongoClient, errors
           client = MongoClient("mongodb://127.0.0.1:27017")
@@ -170,20 +171,10 @@ jobs:
           except errors.CollectionInvalid:
               print("'history' collection already exists.")
           PY
-          echo "✅ Mongo restore complete."
-
           # Cleanup downloaded dump to free space
           echo "🧹 Cleaning up downloaded dump..."
           rm -rf dump_small.tar.gz mongo_dump
           echo "✅ Mongo restore complete and dump cleaned."
-
-
-      - name: Pre-clean big SDKs/caches (free disk)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          sudo rm -rf ~/.cache/pip || true
-          df -h
-
 
       - name: Run export function
         working-directory: Sefaria-Project
@@ -215,48 +206,40 @@ jobs:
           print(f"✅ {fn} completed successfully.")
           PY
 
-      - name: Cleanup MongoDB database after export (free space)
-        run: |
-          echo "🗑️ Dropping MongoDB database 'sefaria' to free up space..."
-          mongosh --quiet --eval 'db.getSiblingDB("sefaria").dropDatabase(); print("✅ Database dropped.")' || \
-          python - <<'PY'
-          from pymongo import MongoClient
-          client = MongoClient("mongodb://127.0.0.1:27017")
-          client.drop_database("sefaria")
-          print("✅ Database dropped via PyMongo fallback.")
-          PY
-          echo "Disk usage after cleanup:"
-          df -h
-
-
-      - name: Compute release timestamp
+      - name: Compute timestamp (for branch/folder names)
         id: ts
         run: |
           TZ="${TZ_NAME}" date '+%Y-%m-%d_%H-%M' > ts.txt
           echo "stamp=$(cat ts.txt)" >> $GITHUB_OUTPUT
+          echo "Timestamp: $(cat ts.txt)"
 
-      - name: Zip exports
-        id: zip
+      - name: Cleanup MongoDB database after export (free space)
         run: |
-          cd "$(dirname "$SEFARIA_EXPORT_PATH")"
-          ZIP_NAME="sefaria-exports-${{ steps.ts.outputs.stamp }}.zip"
-          zip -r "$ZIP_NAME" "$(basename "$SEFARIA_EXPORT_PATH")"
-          echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> $GITHUB_ENV
-          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          ls -lh "$ZIP_NAME"
+          python - <<'PY'
+          from pymongo import MongoClient
+          client = MongoClient("mongodb://127.0.0.1:27017")
+          client.drop_database("sefaria")
+          print("✅ Database 'sefaria' dropped.")
+          PY
+          df -h
 
-      - name: Upload artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.zip.outputs.zip_name }}
-          path: ${{ env.ZIP_PATH }}
+      - name: Move exports into repo path (versioned folder)
+        run: |
+          DEST_DIR="sefaria-exports/${{ steps.ts.outputs.stamp }}"
+          mkdir -p "$DEST_DIR"
+          shopt -s dotglob
+          mv "$SEFARIA_EXPORT_PATH"/* "$DEST_DIR"/
+          echo "Exports staged at $DEST_DIR"
+          ls -la "$DEST_DIR" || true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ts.outputs.stamp }}
-          name: ${{ steps.ts.outputs.stamp }}
-          files: ${{ env.ZIP_PATH }}
-          body: "Automated Sefaria export (${{ env.EXPORT_FUNCTION }}) generated at ${{ env.TZ_NAME }} time: ${{ steps.ts.outputs.stamp }}"
+      - name: Commit and push to new branch
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: exports/${{ steps.ts.outputs.stamp }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH_NAME"
+          git add -A "sefaria-exports/${{ steps.ts.outputs.stamp }}"
+          git commit -m "Sefaria export: ${{ steps.ts.outputs.stamp }}"
+          git push --set-upstream origin "$BRANCH_NAME"
+          echo "✅ Pushed branch: $BRANCH_NAME"
