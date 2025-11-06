@@ -1,4 +1,4 @@
-name: Python 3.9 + MongoDB + Sefaria Export (Matrix + Merge, zstd -19 -T0)
+name: Python 3.9 + MongoDB + Sefaria Export (Matrix + Merge, final zstd -19 -T0)
 
 on:
   workflow_dispatch:
@@ -117,10 +117,10 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-
 
-      - name: Install system helpers (wget, zstd, tar, nc)
+      - name: Install system helpers (wget, tar, nc)
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget ca-certificates zstd tar netcat-openbsd
+          sudo apt-get install -y wget ca-certificates tar netcat-openbsd
 
       - name: Install MongoDB Database Tools (mongorestore)
         run: |
@@ -264,24 +264,23 @@ jobs:
           echo "Disk usage after cleanup:"
           df -h
 
-      - name: Pack export as tar.zst (-19 -T0)
+      - name: Pack export as TAR (no compression)
         run: |
           cd "$SEFARIA_EXPORT_BASE"
-          TARBALL="sefaria-${{ matrix.export_function }}-${TS_STAMP}.tar.zst"
-          # Crée un tar et compresse avec zstd niveau 19, threads auto
-          tar -cf - "${{ matrix.export_function }}" | zstd -19 -T0 -o "${TARBALL}"
+          TARBALL="sefaria-${{ matrix.export_function }}-${TS_STAMP}.tar"
+          tar -cf "${TARBALL}" "${{ matrix.export_function }}"
           echo "PKG_DIR=$(pwd)" >> $GITHUB_ENV
           echo "TARBALL=${TARBALL}" >> $GITHUB_ENV
           ls -lh "${TARBALL}" || true
 
-      - name: Upload tar.zst as artifact
+      - name: Upload TAR as artifact (internal only)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.export_function }}-${{ env.TS_STAMP }}
           path: ${{ env.PKG_DIR }}/${{ env.TARBALL }}
 
   merge_and_split:
-    name: Merge all exports then split <2GB
+    name: Merge all exports then make final zstd <2GB
     runs-on: ubuntu-latest
     needs: [prep, export]
     env:
@@ -297,13 +296,12 @@ jobs:
         with:
           path: downloads
 
-      - name: Decompress all *.tar.zst into one folder
+      - name: Extract all *.tar into one folder
         run: |
           mkdir -p merged/all
-          find downloads -type f -name '*.tar.zst' -print0 | while IFS= read -r -d '' f; do
+          find downloads -type f -name '*.tar' -print0 | while IFS= read -r -d '' f; do
             echo "🔽 Extracting: $f"
-            # Méthode robuste via pipe (compatible toutes versions)
-            unzstd -c "$f" | tar -xf - -C merged/all
+            tar -xf "$f" -C merged/all
           done
           echo "Merged tree (top level):"
           find merged -maxdepth 2 -mindepth 1 -type d -print | sed -e 's/^/  /'
@@ -312,62 +310,73 @@ jobs:
         run: |
           cd merged
           FINAL_BASE="sefaria-ALL-${TS_STAMP}.tar.zst"
-          # tar -> zstd (niveau 19, threads auto)
           tar -cf - "all" | zstd -19 -T0 -o "${FINAL_BASE}"
-          # Split en parts < 2GB (ici 1900m ~ 1.9 GiB)
           split -b 1900m -d -a 3 "${FINAL_BASE}" "${FINAL_BASE}.part-"
           echo "FINAL_DIR=$(pwd)" >> $GITHUB_ENV
           echo "FINAL_BASE=${FINAL_BASE}" >> $GITHUB_ENV
-          ls -lh "${FINAL_BASE}" "${FINAL_BASE}.part-"* 2>/dev/null || true
+          ls -lh "${FINAL_BASE}.part-"* 2>/dev/null || true
 
-      - name: Upload combined parts as artifact
+      - name: Upload combined parts as artifact (only parts)
         uses: actions/upload-artifact@v4
         with:
           name: ALL-${{ env.TS_STAMP }}
-          path: |
-            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}
-            ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}.part-*
+          path: ${{ env.FINAL_DIR }}/${{ env.FINAL_BASE }}.part-*
 
   release:
-    name: Create GitHub Release (attach all artifacts)
+    name: Create GitHub Release (only final bundle, with retries)
     runs-on: ubuntu-latest
     needs: [prep, export, merge_and_split]
+    timeout-minutes: 60
     steps:
-      - name: Download all artifacts
+      - name: Download final parts artifact
         uses: actions/download-artifact@v4
         with:
-          path: downloads
+          name: ALL-${{ needs.prep.outputs.stamp }}
+          path: downloads/final
 
-      - name: Collect files for release
-        id: files
+      - name: Ensure gh cli present
         run: |
-          cd downloads
-          {
-            echo 'files<<EOF'
-            # Inclure les tarballs individuels et les parts combinées
-            find "$(pwd)" -type f \( -name '*.tar.zst' -o -name '*.tar.zst.part-*' \) | sort -V
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "Installing GitHub CLI..."
+            type -p curl >/dev/null || sudo apt-get update
+            sudo apt-get install -y curl
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
+          gh --version
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prep.outputs.stamp }}
-          name: ${{ needs.prep.outputs.stamp }}
-          files: ${{ steps.files.outputs.files }}
-          body: |
-            Automated Sefaria exports generated at ${{ env.TZ_NAME }} time: ${{ needs.prep.outputs.stamp }}.
-
-            Included artifacts (zstd -19 -T0):
-              - Per-export archives: *.tar.zst (one per export function)
-              - Combined archive split: sefaria-ALL-*.tar.zst + *.tar.zst.part-000, part-001, ...
-
-            To restore a per-export archive:
-              - tar --zstd -xf <name>.tar.zst
-              - (or) unzstd -c <name>.tar.zst | tar -xf -
-
-            To restore the combined archive:
-              - cat sefaria-ALL-*.tar.zst.part-* > sefaria-ALL.tar.zst
-              - tar --zstd -xf sefaria-ALL.tar.zst
+      - name: Create GitHub Release (idempotent)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG='${{ needs.prep.outputs.stamp }}'
+          TITLE='${{ needs.prep.outputs.stamp }}'
+          NOTES=$'Automated Sefaria combined export.\n\nIncluded:\n  - ONLY the combined split archive (zstd -19 -T0): sefaria-ALL-*.tar.zst.part-000, part-001, ...\n\nRestore:\n  cat sefaria-ALL-*.tar.zst.part-* > ALL.tar.zst && tar --zstd -xf ALL.tar.zst'
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "$TITLE" -n "$NOTES"
+
+      - name: Upload ONLY the final split parts (with retry)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          TAG='${{ needs.prep.outputs.stamp }}'
+          mapfile -t PARTS < <(find downloads/final -type f -name '*.tar.zst.part-*' | sort -V)
+          for f in "${PARTS[@]}"; do
+            echo "Uploading part: $f"
+            for attempt in {1..6}; do
+              if gh release upload "$TAG" "$f" --clobber; then
+                echo "✅ Uploaded: $f"
+                break
+              fi
+              sleep $((2**attempt))
+              echo "Retry $attempt for $f..."
+              if [[ $attempt -eq 6 ]]; then
+                echo "❌ Failed to upload $f after retries"
+                exit 1
+              fi
+            done
+          done
