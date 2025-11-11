@@ -1,4 +1,4 @@
-name: Python 3.9 + MongoDB + Sefaria Export (no-matrix, split <2GB)
+name: Python 3.9 + MongoDB + Sefaria Export (single-run • zstd ultra • split<2GB)
 
 on:
   workflow_dispatch:
@@ -17,67 +17,44 @@ env:
   MONGO_HOST: 127.0.0.1
   MONGO_PORT: 27017
   MONGO_DB_NAME: sefaria
-  SEFARIA_DB: sefaria
-  EXPORTS_LIST: "export_all_merged export_links export_schemas export_toc"
-  # Taille cible < 2GB (marge de sécurité 1900 MiB)
-  SPLIT_SIZE: "1900m"
 
 jobs:
-  run:
-    name: Build & Release (self-hosted, single runner)
+  export_release:
     runs-on: [self-hosted, Linux, X64]
 
+    services:
+      mongodb:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+
     steps:
-      - name: Compute timestamp
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute release timestamp
         id: ts
         run: |
           TZ="${TZ_NAME}" date '+%Y-%m-%d_%H-%M' > ts.txt
           echo "stamp=$(cat ts.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install base tools (apt, aria2, zstd, tar, nc, curl)
+      - name: Install base tools
         run: |
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            sudo apt-get install -y aria2 ca-certificates zstd tar netcat-openbsd curl
+            sudo apt-get install -y aria2 ca-certificates tar zstd wget netcat-openbsd
           fi
+          python3 -V || true
 
-      - name: Ensure GitHub CLI
-        run: |
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y curl ca-certificates
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            sudo apt-get update -y && sudo apt-get install -y gh
-          fi
-          gh --version
-
-      - name: Start MongoDB (docker) fresh
-        run: |
-          set -e
-          if command -v docker >/dev/null 2>&1; then
-            docker rm -f gh-mongo || true
-            docker run -d --name gh-mongo -p 27017:27017 --health-cmd='mongosh --eval "db.runCommand({ ping: 1 })"' \
-              --health-interval=10s --health-timeout=5s --health-retries=20 mongo:6.0
-          else
-            echo "Docker is required on the self-hosted runner."; exit 1
-          fi
-
-      - name: Wait for MongoDB TCP
-        run: |
-          for i in {1..60}; do
-            if nc -z 127.0.0.1 27017; then
-              echo "✅ MongoDB TCP ready"; exit 0
-            fi
-            echo "⏳ Waiting MongoDB..."; sleep 2
-          done
-          echo "❌ MongoDB not reachable"; exit 1
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
 
       - name: Install MongoDB Database Tools (mongorestore)
         run: |
@@ -89,7 +66,7 @@ jobs:
           fi
           mongorestore --version
 
-      - name: Download small Mongo dump (aria2c)
+      - name: Download small Mongo dump
         run: |
           mkdir -p mongo_dump
           aria2c -x 16 -s 16 -k 1M -o dump_small.tar.gz "https://storage.googleapis.com/sefaria-mongo-backup/dump_small.tar.gz"
@@ -104,50 +81,41 @@ jobs:
           fi
           find mongo_dump_pkg -maxdepth 2 -type d -print
 
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
-
       - name: Clone Sefaria-Project
         run: |
           git clone --depth 1 https://github.com/Sefaria/Sefaria-Project.git
-          ls -la Sefaria-Project
+          ls -la Sefaria-Project | head -n 50
 
-      - name: Install system build deps for google-re2
+      - name: Install build deps (google-re2)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libre2-dev pybind11-dev build-essential cmake ninja-build
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y libre2-dev pybind11-dev build-essential cmake ninja-build
+          fi
 
-      - name: Pin google-re2 and install Python deps
+      - name: Pin google-re2 and install requirements
         id: pip_install
-        continue-on-error: true
         working-directory: Sefaria-Project
+        continue-on-error: true
         run: |
           echo "google-re2==1.0" > constraints-ci.txt
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt -c constraints-ci.txt
 
-      - name: Fallback install built-google-re2 if needed
+      - name: Fallback built-google-re2
         if: ${{ steps.pip_install.outcome == 'failure' }}
         working-directory: Sefaria-Project
         run: |
-          echo "Primary install failed — trying built-google-re2..."
+          echo "Primary install failed — trying built-google-re2 fallback..."
           grep -viE '^\s*google-re2' requirements.txt > req-no-re2.txt || true
           pip install -r req-no-re2.txt
           pip install built-google-re2
 
-      - name: Configure local_settings.py (paths & DB)
+      - name: Create local_settings.py (SEFARIA_DB, export path)
         working-directory: Sefaria-Project/sefaria
+        env:
+          SEFARIA_EXPORT_BASE: ${{ github.workspace }}/exports
         run: |
-          export SEFARIA_EXPORT_BASE="${GITHUB_WORKSPACE}/exports"
           mkdir -p "$SEFARIA_EXPORT_BASE"
           cp local_settings_example.py local_settings.py
           python - <<'PY'
@@ -155,11 +123,10 @@ jobs:
           p = "local_settings.py"
           with open(p, "r", encoding="utf-8") as f:
               s = f.read()
-          base = os.path.join(os.environ["GITHUB_WORKSPACE"], "exports")
-          s = re.sub(r"SEFARIA_EXPORT_PATH\s*=.*", f'SEFARIA_EXPORT_PATH = r"{base}"', s)
-          s = re.sub(r"MONGO_HOST\s*=.*", 'MONGO_HOST = "127.0.0.1"', s)
-          s = re.sub(r"MONGO_PORT\s*=.*", 'MONGO_PORT = 27017', s)
-          s = re.sub(r"MONGO_DB_NAME\s*=.*", 'MONGO_DB_NAME = "sefaria"', s)
+          s = re.sub(r"SEFARIA_EXPORT_PATH\s*=.*", f'SEFARIA_EXPORT_PATH = r"{os.environ["SEFARIA_EXPORT_BASE"]}"', s)
+          s = re.sub(r"MONGO_HOST\s*=.*", f'MONGO_HOST = "{os.environ.get("MONGO_HOST","127.0.0.1")}"', s)
+          s = re.sub(r"MONGO_PORT\s*=.*", f'MONGO_PORT = {int(os.environ.get("MONGO_PORT","27017"))}', s)
+          s = re.sub(r"MONGO_DB_NAME\s*=.*", f'MONGO_DB_NAME = "{os.environ.get("MONGO_DB_NAME","sefaria")}"', s)
           if re.search(r"SEFARIA_DB\s*=", s):
               s = re.sub(r"SEFARIA_DB\s*=.*", 'SEFARIA_DB = "sefaria"', s)
           else:
@@ -169,8 +136,20 @@ jobs:
           print("✅ local_settings.py configured")
           PY
 
-      - name: Restore MongoDB from dump
+      - name: Wait for MongoDB TCP
         run: |
+          for i in {1..60}; do
+            if nc -z 127.0.0.1 27017; then
+              echo "✅ MongoDB reachable"; break
+            fi
+            echo "⏳ Waiting for MongoDB..."; sleep 2
+          done
+
+      - name: Restore database from dump
+        run: |
+          if [ ! -d mongo_dump_pkg/sefaria ]; then
+            echo "❌ mongo_dump_pkg/sefaria not found"; exit 1
+          fi
           mongorestore --host 127.0.0.1 --port 27017 --drop --db sefaria "mongo_dump_pkg/sefaria"
           python - <<'PY'
           from pymongo import MongoClient, errors
@@ -180,95 +159,123 @@ jobs:
               db.create_collection("history")
               print("Created empty 'history' collection.")
           except errors.CollectionInvalid:
-              print("'history' already exists.")
+              print("'history' collection already exists.")
           PY
+          echo "✅ Mongo restore complete."
 
-      - name: Run exports sequentially, compress, split <2GB, upload
+      - name: Run exports (4 fonctions)
+        working-directory: Sefaria-Project
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TS_STAMP: ${{ steps.ts.outputs.stamp }}
+          PYTHONPATH: ${{ github.workspace }}/Sefaria-Project
+          SEFARIA_EXPORT_BASE: ${{ github.workspace }}/exports
         run: |
           set -euo pipefail
-          BASE="${GITHUB_WORKSPACE}/exports"
-          mkdir -p "$BASE"
-          TAG="${TS_STAMP}"
-          TITLE="${TS_STAMP}"
-          NOTES=$'Automated Sefaria exports (zstd --ultra -22 -T0, split <2GB).\n\nExports:\n  - export_all_merged\n  - export_links\n  - export_schemas\n  - export_toc\n\nReassemble any archive:\n  cat <name>.tar.zst.part* > <name>.tar.zst\n  tar --zstd -xf <name>.tar.zst'
-
-          # idempotent release
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "$TITLE" -n "$NOTES"
-
-          pushd Sefaria-Project >/dev/null
-          export PYTHONPATH="${GITHUB_WORKSPACE}/Sefaria-Project"
-          for FN in $EXPORTS_LIST; do
-            echo "=== Running $FN ==="
-            export SEFARIA_EXPORT_PATH="${BASE}/${FN}"
-            mkdir -p "${SEFARIA_EXPORT_PATH}"
-
+          run_export () {
+            local fn="$1"
+            echo "▶ $fn"
             python - <<'PY'
             import os, sys, django
             sys.path.insert(0, os.path.abspath("."))
             os.environ.setdefault("DJANGO_SETTINGS_MODULE", "sefaria.settings")
-            os.environ.setdefault("SEFARIA_EXPORT_PATH", os.environ["SEFARIA_EXPORT_PATH"])
+            os.environ.setdefault("SEFARIA_EXPORT_PATH", os.environ.get("SEFARIA_EXPORT_BASE"))
             django.setup()
             from sefaria import export as ex
-            fn = os.environ["FN_NAME"]
             allowed = {
               "export_all_merged": ex.export_all_merged,
               "export_links": ex.export_links,
               "export_schemas": ex.export_schemas,
               "export_toc": ex.export_toc,
             }
+            fn = os.environ["FN"]
             if fn not in allowed:
               raise SystemExit(f"Unknown export function: {fn}")
             allowed[fn]()
             print(f"✅ {fn} completed.")
             PY
-          done
-          popd >/dev/null
+          }
+          export FN=export_all_merged; run_export "$FN"
+          export FN=export_links;       run_export "$FN"
+          export FN=export_schemas;     run_export "$FN"
+          export FN=export_toc;         run_export "$FN"
 
-          # Pack, split, checksum, upload
-          for FN in $EXPORTS_LIST; do
-            PKG_BASENAME="sefaria-${FN}-${TS_STAMP}.tar.zst"
-            SRC_DIR="${BASE}/${FN}"
-            echo "=== Packaging ${SRC_DIR} -> ${PKG_BASENAME} ==="
-            tar -C "${BASE}" -cf - "${FN}" | zstd --ultra -22 -T0 -o "${PKG_BASENAME}"
-            ls -lh "${PKG_BASENAME}"
-            # checksum global (sur l’archive complète)
-            sha256sum "${PKG_BASENAME}" > "${PKG_BASENAME}.sha256"
-
-            # split en <2GB
-            split -b "${SPLIT_SIZE}" -d -a 3 "${PKG_BASENAME}" "${PKG_BASENAME}.part"
-            rm -f "${PKG_BASENAME}"  # garder uniquement les parts
-
-            # checksums des parts
-            sha256sum "${PKG_BASENAME}.part"* > "${PKG_BASENAME}.parts.sha256"
-
-            # Upload (retry)
-            for f in $(ls -1 "${PKG_BASENAME}.part"* "${PKG_BASENAME}.sha256" "${PKG_BASENAME}.parts.sha256"); do
-              echo "Uploading $f"
-              for attempt in 1 2 3 4 5 6; do
-                if gh release upload "${TAG}" "$f" --clobber; then
-                  echo "✅ Uploaded: $f"; break
-                fi
-                sleep $((2**attempt))
-                echo "Retry $attempt for $f..."
-                if [ "$attempt" = "6" ]; then
-                  echo "❌ Failed to upload $f"; exit 1
-                fi
-              done
-            done
-
-            # libérer l’espace (on garde pas les sources ni parts locales)
-            rm -rf "${SRC_DIR}"
-            rm -f "${PKG_BASENAME}.part"*
-            rm -f "${PKG_BASENAME}.sha256" "${PKG_BASENAME}.parts.sha256"
-            df -h
-          done
-
-      - name: Stop & clean Mongo docker
-        if: always()
+      - name: Drop DB (free space)
         run: |
-          docker rm -f gh-mongo || true
-          docker system prune -af || true
+          mongosh --quiet --eval 'db.getSiblingDB("sefaria").dropDatabase(); print("✅ DB dropped.")' || true
           df -h
+
+      - name: Build ONE combined tar.zst (flattened to root)
+        env:
+          TS_STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          COMBINED="sefaria-exports-${TS_STAMP}.tar.zst"
+          # Aplatir: mettre le contenu de chaque export directement à la racine
+          tar -cf - \
+            -C exports/export_all_merged . \
+            -C exports/export_links . \
+            -C exports/export_schemas . \
+            -C exports/export_toc . \
+          | zstd --ultra -22 -T0 -o "${COMBINED}"
+          ls -lh "${COMBINED}"
+
+      - name: Split archive into <2GB parts
+        env:
+          TS_STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          COMBINED="sefaria-exports-${TS_STAMP}.tar.zst"
+          # Découpe en ~1.9GB pour rester sous 2GB par asset
+          split -b 1900m -d -a 2 "${COMBINED}" "${COMBINED}.part-"
+          PARTS=( ${COMBINED}.part-* )
+          if [ "${#PARTS[@]}" -eq 1 ]; then
+            # Un seul morceau -> on le renomme en fichier final
+            mv "${PARTS[0]}" "${COMBINED}"
+            echo "SINGLE_PART=${COMBINED}" >> "$GITHUB_ENV"
+          else
+            printf "%s\n" "${PARTS[@]}"
+          fi
+
+      - name: Ensure gh cli
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+          gh --version
+
+      - name: Create/Update Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TS_STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          TAG="${TS_STAMP}"
+          TITLE="${TS_STAMP}"
+          NOTES=$'Combined Sefaria exports (zstd --ultra -22 -T0).\n\nContents are flattened at archive root from:\n- export_all_merged\n- export_links\n- export_schemas\n- export_toc\n\nRestore:\n  # si parts\n  cat sefaria-exports-'"${TS_STAMP}"'.tar.zst.part-* > combined.tar.zst && tar --zstd -xf combined.tar.zst\n  # si unique\n  tar --zstd -xf sefaria-exports-'"${TS_STAMP}"'.tar.zst'
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "$TITLE" -n "$NOTES"
+
+      - name: Upload parts (or single file)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TS_STAMP: ${{ steps.ts.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          TAG="${TS_STAMP}"
+          shopt -s nullglob
+          FILES=( sefaria-exports-"${TS_STAMP}".tar.zst.part-* )
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            FILES=( sefaria-exports-"${TS_STAMP}".tar.zst )
+          fi
+          for f in "${FILES[@]}"; do
+            echo "Uploading $f"
+            for attempt in {1..5}; do
+              if gh release upload "$TAG" "$f" --clobber; then
+                echo "✅ Uploaded: $f"; break
+              fi
+              sleep $((2**attempt))
+              echo "Retry $attempt for $f..."
+              if [[ $attempt -eq 5 ]]; then
+                echo "❌ Failed to upload $f"; exit 1
+              fi
+            done
+          done
