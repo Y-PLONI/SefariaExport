@@ -1,4 +1,4 @@
-name: Python 3.9 + MongoDB + Sefaria Export (Self-hosted, all_merged → branch root)
+name: Sefaria Export (Self-hosted • Python 3.9 • export_all_merged → branch root)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sefaria-export
+  group: sefaria-export-selfhosted
   cancel-in-progress: false
 
 env:
@@ -32,24 +32,23 @@ jobs:
     steps:
       - name: Compute release timestamp
         id: ts
-        shell: bash
         run: |
-          set -euo pipefail
           TZ="${TZ_NAME}" date '+%Y-%m-%d_%H-%M' > ts.txt
           echo "stamp=$(cat ts.txt)" >> $GITHUB_OUTPUT
-          echo "⏱  Using TZ=${TZ_NAME} -> $(cat ts.txt)"
+          echo "⏱ Using TZ=${TZ_NAME} -> $(cat ts.txt)"
 
   export_and_push:
-    name: Export all_merged and push to date branch
+    name: Export export_all_merged and push to date branch
     runs-on: [self-hosted, Linux, X64]
     needs: prep
+
     env:
       TS_STAMP: ${{ needs.prep.outputs.stamp }}
       SEFARIA_EXPORT_BASE: ${{ github.workspace }}/staging
       SEFARIA_EXPORT_PATH: ${{ github.workspace }}/staging
 
     steps:
-      - name: Checkout .github only (sparse)
+      - name: Checkout CI folder only (sparse)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -58,138 +57,141 @@ jobs:
             .github
           sparse-checkout-cone-mode: false
 
-      - name: Set up Python 3.9 (toolcache)
-        id: py
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-          check-latest: true
-
-      - name: Show Python info
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v python || true
-          command -v python3 || true
-          python --version || true
-          python3 --version || true
-
-      - name: Ensure basic system tools (apt/dnf/yum/apk)
+      - name: Ensure basic tools (apt/dnf/yum/apk)
         shell: bash
         run: |
           set -e
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            sudo apt-get install -y ca-certificates tar wget rsync coreutils netcat-openbsd git
+            sudo apt-get install -y ca-certificates tar wget rsync coreutils netcat-openbsd jq
+            sudo apt-get install -y aria2 || true
           elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y ca-certificates tar wget rsync coreutils nmap-ncat git
+            sudo dnf install -y ca-certificates tar wget rsync coreutils nmap-ncat jq
+            sudo dnf install -y aria2 || true
           elif command -v yum >/dev/null 2>&1; then
-            sudo yum install -y ca-certificates tar wget rsync coreutils nmap-ncat git
+            sudo yum install -y ca-certificates tar wget rsync coreutils nmap-ncat jq
+            sudo yum install -y aria2 || true
           elif command -v apk >/dev/null 2>&1; then
-            sudo apk add --no-cache ca-certificates tar wget rsync coreutils netcat-openbsd git
+            sudo apk add --no-cache ca-certificates tar wget rsync coreutils netcat-openbsd jq aria2
           fi
-          echo "✅ System tools ensured."
+          echo "✅ Base tools ok"
 
-      - name: Create Python 3.9 virtualenv (avoids PEP 668)
-        shell: bash
+      - name: Set up Python 3.9 (toolcache)
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Create and activate venv
+        id: venv
         run: |
-          set -euo pipefail
+          set -e
+          python -V && which python
           python -m venv .venv
-          . .venv/bin/activate
-          python -V
+          source .venv/bin/activate
+          python -V && which python
           pip -V
-          python -m pip install --upgrade pip setuptools wheel
+          echo "VENV_BIN=$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_OUTPUT
 
-      - name: Start MongoDB 6 with Docker (sudo)
-        id: mongostart
+      - name: Install build essentials for some wheels
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential cmake ninja-build pkg-config libre2-dev pybind11-dev
+          elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y gcc-c++ make cmake ninja-build pkgconfig re2-devel pybind11-devel
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y gcc-c++ make cmake ninja-build pkgconfig re2-devel pybind11-devel
+          elif command -v apk >/dev/null 2>&1; then
+            sudo apk add --no-cache build-base cmake ninja py3-pybind11 re2-dev
+          fi
+          echo "✅ Build toolchain ok"
+
+      - name: Start MongoDB (prefer Docker with sudo; fallback to native install)
+        id: mongo
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
+          # Try Docker first (with sudo to avoid sock perms)
           if command -v docker >/dev/null 2>&1; then
-            echo "Using Dockerized MongoDB..."
+            echo "Trying Dockerized MongoDB..."
             sudo docker rm -f gha-mongo >/dev/null 2>&1 || true
-            sudo docker run -d --name gha-mongo -p 27017:27017 mongo:6.0
-            echo "docker=1" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Docker not found on the runner. Install Docker or run a local mongod on 127.0.0.1:27017."
-            exit 1
+            if sudo docker run -d --name gha-mongo -p 27017:27017 mongo:6.0 >/dev/null; then
+              echo "mode=docker" >> $GITHUB_OUTPUT
+            else
+              echo "Docker present but failed to run mongo, will try native." >&2
+              sudo docker rm -f gha-mongo >/dev/null 2>&1 || true
+            fi
+          fi
+
+          MODE=$(grep -oP '(?<=mode=).*' <<<"$(cat $GITHUB_OUTPUT 2>/dev/null)" || true)
+          if [ "$MODE" != "docker" ]; then
+            echo "Using native MongoDB..."
+            if command -v apt-get >/dev/null 2>&1; then
+              # Install MongoDB Community 6.0 on Ubuntu/Debian
+              UB_CODENAME="$(. /etc/os-release && echo ${VERSION_CODENAME:-jammy})"
+              curl -fsSL https://pgp.mongodb.com/server-6.0.asc | sudo tee /usr/share/keyrings/mongodb-server-6.0.gpg >/dev/null
+              echo "deb [signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg] https://repo.mongodb.org/apt/ubuntu ${UB_CODENAME}/mongodb-org/6.0 multiverse" | \
+                sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+              sudo apt-get update -y
+              sudo apt-get install -y mongodb-org
+              sudo systemctl enable --now mongod
+            else
+              echo "❌ Native MongoDB install not implemented for this distro; please install mongod or enable Docker." >&2
+              exit 1
+            fi
+            echo "mode=native" >> $GITHUB_OUTPUT
           fi
 
       - name: Wait for MongoDB TCP
-        shell: bash
         run: |
-          set -euo pipefail
           for i in {1..120}; do
             if (echo > /dev/tcp/127.0.0.1/27017) >/dev/null 2>&1; then
-              echo "✅ MongoDB TCP port is reachable"; exit 0
+              echo "✅ MongoDB TCP is up"; exit 0
             fi
-            echo "⏳ Waiting for MongoDB TCP..."; sleep 1
+            echo "⏳ Waiting MongoDB..."; sleep 1
           done
-          echo "❌ MongoDB did not become reachable"; exit 1
+          echo "❌ MongoDB did not start"; exit 1
 
-      - name: Ensure mongorestore (MongoDB Database Tools)
-        shell: bash
+      - name: Ensure MongoDB Database Tools (mongorestore)
         run: |
-          set -euo pipefail
           if ! command -v mongorestore >/dev/null 2>&1; then
+            echo "Installing MongoDB Database Tools..."
             TOOLS_VER="100.9.4"
-            if command -v apt-get >/dev/null 2>&1; then
-              wget -q https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}.tgz
-              tar -xzf mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}.tgz
-              sudo mv mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}/bin/* /usr/local/bin/
-            else
-              echo "⚠️ mongorestore not found and auto-install path unknown for this distro. Skipping (assume present)."
-            fi
+            wget -q https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}.tgz
+            tar -xzf mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}.tgz
+            sudo mv mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}/bin/* /usr/local/bin/
+            rm -rf mongodb-database-tools-ubuntu2204-x86_64-${TOOLS_VER}*
           fi
-          mongorestore --version || true
+          mongorestore --version
 
-      - name: Clone Sefaria-Project
-        shell: bash
+      - name: Clone Sefaria-Project (main repo)
         run: |
-          set -euo pipefail
           git clone --depth 1 https://github.com/Sefaria/Sefaria-Project.git
           ls -la Sefaria-Project
 
-      - name: Prepare requirements overrides (swap google-re2/psycopg2)
-        shell: bash
+      - name: Install Python deps (skip google-re2, use psycopg2-binary)
         working-directory: Sefaria-Project
         run: |
-          set -euo pipefail
-          # 1) constraints that REPLACE problematic deps
-          cat > constraints-ci.txt <<'EOF'
-          # Use prebuilt RE2 (no Bazel)
-          built-google-re2==0.3
-          # Prefer binary psycopg2 (no libpq-dev needed)
-          psycopg2-binary==2.9.9
-          # Keep Cython modern but 3.9 compatible
-          Cython>=0.29.36
-          EOF
-
-          # 2) requirements without google-re2 / psycopg2
-          grep -viE '^\s*(google-re2|psycopg2)\b' requirements.txt > req-no-heavy.txt || true
-          echo "✅ Wrote constraints-ci.txt and req-no-heavy.txt"
-
-      - name: Install Python deps inside venv
-        shell: bash
-        working-directory: Sefaria-Project
-        run: |
-          set -euo pipefail
-          . "${GITHUB_WORKSPACE}/.venv/bin/activate"
+          set -e
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
           python -V
-          pip install --upgrade pip setuptools wheel
-          # First install everything except the heavy ones
-          pip install --no-cache-dir -r req-no-heavy.txt
-          # Then install our replacements
-          pip install --no-cache-dir -c constraints-ci.txt built-google-re2 psycopg2-binary
+          pip install --upgrade pip wheel setuptools
+          # Pré-installe Cython pour éviter l'erreur "collections.Iterable" sur 3.12 et cie (simple sécurité)
+          pip install "Cython<3.1" || true
+          # Filtrer requirements : retirer google-re2 (bazel), psycopg2 (on met psycopg2-binary)
+          grep -viE '^\s*(google-re2|psycopg2)\b' requirements.txt > req-no-re2-psycopg.txt || true
+          pip install -r req-no-re2-psycopg.txt
+          pip install "psycopg2-binary==2.9.9"
 
-      - name: Create minimal local_settings.py (SEFARIA_DB=sefaria)
-        shell: bash
+      - name: Create local_settings.py (SEFARIA_DB etc.)
         working-directory: Sefaria-Project/sefaria
         run: |
-          set -euo pipefail
+          set -e
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
           mkdir -p "$SEFARIA_EXPORT_PATH"
           cp local_settings_example.py local_settings.py
-          "${GITHUB_WORKSPACE}/.venv/bin/python" - <<'PY'
+          python - <<'PY'
           import os, re
           p = "local_settings.py"
           with open(p, "r", encoding="utf-8") as f:
@@ -208,9 +210,8 @@ jobs:
           PY
 
       - name: Download small Mongo dump
-        shell: bash
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p mongo_dump
           if command -v aria2c >/dev/null 2>&1; then
             aria2c -x 16 -s 16 -k 1M -o dump_small.tar.gz "https://storage.googleapis.com/sefaria-mongo-backup/dump_small.tar.gz"
@@ -219,12 +220,11 @@ jobs:
           fi
           tar -xzf dump_small.tar.gz -C mongo_dump
           rm -f dump_small.tar.gz || true
-          echo "Dump tree:"; find mongo_dump -maxdepth 3 | sed -e 's/^/  /'
+          find mongo_dump -maxdepth 3 -type d -print | sed -e 's/^/  /'
 
-      - name: Normalize layout to mongo_dump_pkg/sefaria
-        shell: bash
+      - name: Normalize dump path to mongo_dump_pkg/sefaria
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p mongo_dump_pkg
           if [ -d mongo_dump/dump/sefaria ]; then
             cp -a mongo_dump/dump/sefaria mongo_dump_pkg/
@@ -233,15 +233,14 @@ jobs:
           else
             echo "❌ Could not find 'sefaria' folder in dump"; exit 1
           fi
-          echo "Packaged tree:"; find mongo_dump_pkg -maxdepth 2 | sed -e 's/^/  /'
+          find mongo_dump_pkg -maxdepth 2 -type d -print | sed -e 's/^/  /'
 
       - name: Restore DB and run export_all_merged
-        shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/Sefaria-Project
         run: |
           set -euo pipefail
-          . "${GITHUB_WORKSPACE}/.venv/bin/activate"
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
 
           BASE="$SEFARIA_EXPORT_BASE"
           mkdir -p "$BASE"
@@ -261,10 +260,10 @@ jobs:
               print("'history' collection already exists.")
           PY
 
+          # Pointer SEFARIA_EXPORT_PATH vers staging/export_all_merged
           export CUR_EXPORT="export_all_merged"
           DEST_DIR="$BASE/$CUR_EXPORT"
           mkdir -p "$DEST_DIR"
-
           python - <<'PY'
           import os, re
           p = os.path.join("Sefaria-Project","sefaria","local_settings.py")
@@ -284,27 +283,25 @@ jobs:
           django.setup()
           from sefaria import export as ex
           ex.export_all_merged()
-          print("✅ export_all_merged completed successfully.")
+          print("✅ export_all_merged completed.")
           PY
 
           rsync -a "$DEST_DIR/" "$FINAL_DIR/" || cp -a "$DEST_DIR/." "$FINAL_DIR/"
 
       - name: Drop DB and cleanup
         if: always()
-        shell: bash
         run: |
           set +e
-          echo "🗑️ Dropping MongoDB database 'sefaria'..."
           mongosh --quiet --eval 'db.getSiblingDB("sefaria").dropDatabase(); print("✅ Database dropped.")' 2>/dev/null || true
           sudo docker rm -f gha-mongo >/dev/null 2>&1 || true
           rm -rf mongo_dump mongo_dump_pkg Sefaria-Project || true
           rm -rf ~/.cache/pip || true
+          echo "Disk usage:"
           df -h || true
 
       - name: Push exported content to date-named branch (root + keep .github)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
           set -euo pipefail
           REPO_DIR="$RUNNER_TEMP/pushrepo"
@@ -315,10 +312,13 @@ jobs:
           git -C "$REPO_DIR" remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           TS_BRANCH="${TS_STAMP}"
           git -C "$REPO_DIR" checkout --orphan "$TS_BRANCH"
+
+          # Garder seulement CI + exporter à la racine
           mkdir -p "$REPO_DIR/.github"
           cp -a "$GITHUB_WORKSPACE/.github/." "$REPO_DIR/.github/"
           FINAL_DIR="$RUNNER_TEMP/final_root"
           cp -a "$FINAL_DIR/." "$REPO_DIR/"
+
           cd "$REPO_DIR"
           git add -A
           if git diff --cached --quiet; then
