@@ -89,7 +89,7 @@ jobs:
           python -V
           pip -V
           pip install --upgrade pip setuptools wheel
-          echo "VENV_BIN=$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_ENV
+          echo "VENV_BIN=$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_ENV"
 
       - name: Install MongoDB Database Tools (mongorestore)
         shell: bash
@@ -108,7 +108,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Si mongod est installé en service, on essaye de le démarrer (sinon on suppose qu'il tourne déjà sur le VPS)
+          # If mongod is installed as a systemd service, try to start it (otherwise assume it's already running on the VPS)
           sudo systemctl start mongod 2>/dev/null || true
           for i in {1..120}; do
             if (echo > /dev/tcp/${MONGO_HOST}/${MONGO_PORT}) >/dev/null 2>&1; then
@@ -131,9 +131,9 @@ jobs:
         run: |
           set -euo pipefail
           cd Sefaria-Project
-          # 1) retirer google-re2 (évite bazel)
+          # 1) remove google-re2 (avoid bazel)
           grep -viE '^\s*google-re2\s*(==|>=|>|<|~=)?' requirements.txt > req-no-re2.txt || true
-          # 2) remplacer psycopg2 par psycopg2-binary (évite compile)
+          # 2) replace psycopg2 with psycopg2-binary (avoid build from source)
           sed -i 's/^\s*psycopg2\s*$/psycopg2-binary/g' req-no-re2.txt || true
           sed -i 's/^\s*psycopg2[<>=~].*$/psycopg2-binary/g' req-no-re2.txt || true
           echo "---- effective requirements (without google-re2) ----"
@@ -144,12 +144,12 @@ jobs:
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.venv/bin/activate"
-          pip install -U pip setuptools wheel
-          # Certaines dépendances demandent Cython au build
-          pip install -U Cython
-          pip install --no-cache-dir -r Sefaria-Project/req-no-re2.txt
+          python -m pip install -U pip setuptools wheel
+          # some deps need Cython at build-time
+          python -m pip install -U Cython
+          python -m pip install --no-cache-dir -r Sefaria-Project/req-no-re2.txt
 
-      - name: Add re2 shim (fallback → stdlib re)
+      - name: Add re2 shim (fallback → stdlib re)  # <-- corrigé: pas d'erreur PYTHONPATH avec set -u
         shell: bash
         run: |
           set -euo pipefail
@@ -157,7 +157,8 @@ jobs:
           # Minimal shim to satisfy "import re2 as re"
           from re import *
           PY
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/Sefaria-Project:$PYTHONPATH" >> $GITHUB_ENV
+          # Safe export: append only if PYTHONPATH already exists
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}/Sefaria-Project${PYTHONPATH:+:${PYTHONPATH}}" >> "$GITHUB_ENV"
 
       - name: Configure local_settings.py (SEFARIA_DB + export path)
         shell: bash
@@ -165,7 +166,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$SEFARIA_EXPORT_PATH"
           cp Sefaria-Project/sefaria/local_settings_example.py Sefaria-Project/sefaria/local_settings.py
-          python3 - <<'PY'
+          source "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python - <<'PY'
           import os, re
           p = "Sefaria-Project/sefaria/local_settings.py"
           with open(p, "r", encoding="utf-8") as f:
@@ -223,7 +225,8 @@ jobs:
           python - <<'PY'
           from pymongo import MongoClient, errors
           import os
-          client = MongoClient(f"mongodb://{os.environ['MONGO_HOST']}:{os.environ['MONGO_PORT']}")
+          uri = f"mongodb://{os.environ['MONGO_HOST']}:{os.environ['MONGO_PORT']}"
+          client = MongoClient(uri, serverSelectionTimeoutMS=5000)
           db = client[os.environ['SEFARIA_DB']]
           try:
               db.create_collection("history")
@@ -239,7 +242,7 @@ jobs:
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.venv/bin/activate"
-          # Rediriger SEFARIA_EXPORT_PATH vers staging/export_all_merged
+          # Redirect SEFARIA_EXPORT_PATH → staging/export_all_merged
           python - <<'PY'
           import os, re
           p = os.path.join("Sefaria-Project","sefaria","local_settings.py")
@@ -252,7 +255,7 @@ jobs:
           print("➡️  SEFARIA_EXPORT_PATH set to:", dest)
           PY
 
-          export PYTHONPATH="$GITHUB_WORKSPACE/Sefaria-Project:$PYTHONPATH"
+          export PYTHONPATH="${GITHUB_WORKSPACE}/Sefaria-Project${PYTHONPATH:+:${PYTHONPATH}}"
           python - <<'PY'
           import os, sys, django
           sys.path.insert(0, os.path.abspath("Sefaria-Project"))
@@ -292,11 +295,11 @@ jobs:
           TS_BRANCH="${TS_STAMP}"
           git -C "$REPO_DIR" checkout --orphan "$TS_BRANCH"
 
-          # Conserver les workflows
+          # keep workflows
           mkdir -p "$REPO_DIR/.github"
           cp -a "$GITHUB_WORKSPACE/.github/." "$REPO_DIR/.github/"
 
-          # Copier l’export à la racine
+          # copy export at repo root
           FINAL_DIR="$RUNNER_TEMP/final_root"
           cp -a "$FINAL_DIR/." "$REPO_DIR/"
 
