@@ -33,6 +33,7 @@ jobs:
     steps:
       - name: Compute release timestamp
         id: ts
+        shell: bash
         run: |
           set -euo pipefail
           TZ="${TZ_NAME}" date '+%Y-%m-%d_%H-%M' > ts.txt
@@ -48,6 +49,17 @@ jobs:
       SEFARIA_EXPORT_BASE: ${{ github.workspace }}/staging
       SEFARIA_EXPORT_PATH: ${{ github.workspace }}/staging
     steps:
+      - name: Pre-clean Mongo (containers & service)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Kill any docker container named like mongo
+          docker ps -aq --filter "name=mongo" | xargs -r docker rm -f || true
+          # Stop local mongod if left running
+          sudo systemctl stop mongod 2>/dev/null || true
+          # Free port 27017 (best-effort)
+          (sudo fuser -k 27017/tcp || true) 2>/dev/null || true
+
       - name: Checkout .github (sparse)
         uses: actions/checkout@v4
         with:
@@ -64,18 +76,15 @@ jobs:
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            # core tools
-            sudo apt-get install -y ca-certificates tar wget rsync netcat-openbsd xz-utils git
+            sudo apt-get install -y ca-certificates tar wget rsync netcat-openbsd xz-utils git curl
             sudo apt-get install -y aria2 || true
-            # Python 3.9 + venv + distutils
             sudo apt-get install -y python3.9 python3.9-venv python3.9-distutils
-            # Bootstrap pip for 3.9 if absent
             if ! /usr/bin/python3.9 -m pip -V >/dev/null 2>&1; then
               curl -fsSL https://bootstrap.pypa.io/pip/3.9/get-pip.py -o /tmp/get-pip.py
               /usr/bin/python3.9 /tmp/get-pip.py
             fi
           else
-            echo "❌ This step assumes APT-based distro. Install Python 3.9 + venv and basic tools manually."
+            echo "❌ This step assumes an APT-based distro. Install Python 3.9 + venv and basic tools manually."
             exit 1
           fi
           echo "✅ System deps ready."
@@ -108,7 +117,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # If mongod is installed as a systemd service, try to start it (otherwise assume it's already running on the VPS)
           sudo systemctl start mongod 2>/dev/null || true
           for i in {1..120}; do
             if (echo > /dev/tcp/${MONGO_HOST}/${MONGO_PORT}) >/dev/null 2>&1; then
@@ -131,9 +139,7 @@ jobs:
         run: |
           set -euo pipefail
           cd Sefaria-Project
-          # 1) remove google-re2 (avoid bazel)
           grep -viE '^\s*google-re2\s*(==|>=|>|<|~=)?' requirements.txt > req-no-re2.txt || true
-          # 2) replace psycopg2 with psycopg2-binary (avoid build from source)
           sed -i 's/^\s*psycopg2\s*$/psycopg2-binary/g' req-no-re2.txt || true
           sed -i 's/^\s*psycopg2[<>=~].*$/psycopg2-binary/g' req-no-re2.txt || true
           echo "---- effective requirements (without google-re2) ----"
@@ -145,11 +151,10 @@ jobs:
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.venv/bin/activate"
           python -m pip install -U pip setuptools wheel
-          # some deps need Cython at build-time
           python -m pip install -U Cython
           python -m pip install --no-cache-dir -r Sefaria-Project/req-no-re2.txt
 
-      - name: Add re2 shim (fallback → stdlib re)  # <-- corrigé: pas d'erreur PYTHONPATH avec set -u
+      - name: Add re2 shim (fallback → stdlib re)
         shell: bash
         run: |
           set -euo pipefail
@@ -157,7 +162,6 @@ jobs:
           # Minimal shim to satisfy "import re2 as re"
           from re import *
           PY
-          # Safe export: append only if PYTHONPATH already exists
           echo "PYTHONPATH=${GITHUB_WORKSPACE}/Sefaria-Project${PYTHONPATH:+:${PYTHONPATH}}" >> "$GITHUB_ENV"
 
       - name: Configure local_settings.py (SEFARIA_DB + export path)
@@ -242,7 +246,6 @@ jobs:
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/.venv/bin/activate"
-          # Redirect SEFARIA_EXPORT_PATH → staging/export_all_merged
           python - <<'PY'
           import os, re
           p = os.path.join("Sefaria-Project","sefaria","local_settings.py")
@@ -275,7 +278,6 @@ jobs:
           rsync -a "$SEFARIA_EXPORT_BASE/export_all_merged/" "$FINAL_DIR/" || cp -a "$SEFARIA_EXPORT_BASE/export_all_merged/." "$FINAL_DIR/"
           echo "---- FINAL_DIR tree ----"
           (cd "$FINAL_DIR" && find . -maxdepth 2 | sed -e 's/^/  /')
-          # fail hard if empty
           if [ -z "$(ls -A "$FINAL_DIR")" ]; then
             echo "❌ FINAL_DIR is empty; nothing to push"; exit 1
           fi
@@ -310,13 +312,23 @@ jobs:
           if git diff --cached --quiet; then
             echo "⚠️ No changes to commit."
           else
-            echo "Files to commit:"; git status --porcelain | sed -e 's/^/  /' | head -n 200
+            echo "Files to commit:"
+            # Put `head` BEFORE `sed` to avoid SIGPIPE with pipefail
+            git status --porcelain | head -n 200 | sed -e 's/^/  /' || true
             git commit -m "chore(export): export_all_merged at ${TS_STAMP} [skip ci]"
             git push --force origin HEAD:"$TS_BRANCH"
             echo "✅ Pushed branch ${TS_BRANCH}"
           fi
 
-      - name: Cleanup
+      - name: Post-clean Mongo (containers & temp)
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          docker ps -aq --filter "name=mongo" | xargs -r docker rm -f || true
+          sudo systemctl stop mongod 2>/dev/null || true
+
+      - name: Cleanup workspace
         if: always()
         shell: bash
         run: |
