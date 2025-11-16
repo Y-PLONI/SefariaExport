@@ -15,7 +15,7 @@ fi
 
 # Archive all the contents of the exports directory
 echo "📦 Creating archive from exports/ directory..."
-tar -cf - -C exports . | zstd --ultra -22 -T0 -o "${COMBINED}"
+tar -cf - -C exports . | zstd --ultra -19 -T0 -o "${COMBINED}"
 
 ls -lh "${COMBINED}"
 echo "✅ Archive created: ${COMBINED}"
