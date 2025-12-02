@@ -95,4 +95,8 @@ fi
 # Ensure 'history' collection exists (some exports expect it)
 python ./ensure_history_collection.py
 
+if [ "${KEEP_MONGO_DUMP:-false}" != "true" ]; then
+  rm -rf mongo_dump_pkg
+fi
+
 echo "✅ Mongo restore complete."
