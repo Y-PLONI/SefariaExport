@@ -20,8 +20,8 @@ def main() -> None:
     with open(p, "r", encoding="utf-8") as f:
         s = f.read()
 
-    export_base = os.environ.get("SEFARIA_EXPORT_BASE", "")
-    s = re.sub(r"SEFARIA_EXPORT_PATH\s*=.*", f'SEFARIA_EXPORT_PATH = r"{export_base}"', s)
+    export_path = os.environ.get("SEFARIA_EXPORT_PATH", os.environ.get("SEFARIA_EXPORT_BASE", ""))
+    s = re.sub(r"SEFARIA_EXPORT_PATH\s*=.*", f'SEFARIA_EXPORT_PATH = r"{export_path}"', s)
     s = re.sub(r"MONGO_HOST\s*=.*", f'MONGO_HOST = "{os.environ.get("MONGO_HOST", "127.0.0.1")}"', s)
     s = re.sub(r"MONGO_PORT\s*=.*", f'MONGO_PORT = {int(os.environ.get("MONGO_PORT", "27017"))}', s)
     s = re.sub(r"MONGO_DB_NAME\s*=.*", f'MONGO_DB_NAME = "{os.environ.get("MONGO_DB_NAME", "sefaria")}"', s)
