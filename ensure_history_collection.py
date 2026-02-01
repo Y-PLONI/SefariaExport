@@ -3,12 +3,17 @@
 Ensure the MongoDB collection 'history' exists in the 'sefaria' database.
 
 """
+import os
 from pymongo import MongoClient, errors
 
 
 def main() -> None:
-    client = MongoClient("mongodb://127.0.0.1:27017")
-    db = client["sefaria"]
+    host = os.environ.get("MONGO_HOST", "127.0.0.1")
+    port = int(os.environ.get("MONGO_PORT", "27017"))
+    db_name = os.environ.get("MONGO_DB_NAME", "sefaria")
+
+    client = MongoClient(host=host, port=port)
+    db = client[db_name]
     try:
         db.create_collection("history")
         print("Created empty 'history' collection.")

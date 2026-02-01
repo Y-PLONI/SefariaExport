@@ -1,0 +1,37 @@
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: sefaria-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sefaria-exporter
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - TZ=Asia/Jerusalem
+      - DJANGO_SETTINGS_MODULE=sefaria.settings
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DB_NAME=sefaria
+      - SEFARIA_EXPORT_PATH=/app/exports
+    volumes:
+      - ./exports:/app/exports
+      - ./output:/app/output
+    # Increase shared memory for MongoDB operations
+    shm_size: 2gb
+
+volumes:
+  mongodb_data:

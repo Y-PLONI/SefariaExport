@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.iml
+
+# Exports and output (generated)
+exports/
+output/
+*.tar.zst
+*.part*
+
+# Cloned repos (will be cloned inside container)
+Sefaria-Project/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
