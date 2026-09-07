@@ -20,7 +20,13 @@ from downstream_intent import (
     TARGET_WORKFLOW,
     load_and_validate,
 )
-from release_contract import ContractError, sha256_file
+from release_contract import (
+    TAG_RE,
+    ContractError,
+    read_json,
+    require_int,
+    sha256_file,
+)
 from resolve_release_chain_head import verify_release_asset_contract
 
 
@@ -38,6 +44,10 @@ TERMINAL_CONCLUSIONS = {
 }
 MAX_RERUN_ATTEMPTS = 3
 GITHUB_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+ACKNOWLEDGEMENT_FILE = Path(__file__).resolve().parent / "acknowledged_dead_letters.json"
+ACKNOWLEDGEMENT_SCHEMA_VERSION = 1
+ACKNOWLEDGEMENT_KEYS = {"tag", "root_run_id", "acknowledged_on", "reason"}
+ACKNOWLEDGEMENT_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class ReconcileError(RuntimeError):
@@ -46,6 +56,12 @@ class ReconcileError(RuntimeError):
 
 class ExhaustedIntent(ReconcileError):
     """A downstream root already emitted its bounded failure attempts."""
+
+    def __init__(self, message: str, root_run_id: int) -> None:
+        super().__init__(message)
+        # The acknowledgement store binds a tag to the exact root that went
+        # terminal, so the root identity has to survive the raise.
+        self.root_run_id = root_run_id
 
 
 def parse_github_timestamp(value: str) -> dt.datetime:
@@ -57,6 +73,79 @@ def parse_github_timestamp(value: str) -> dt.datetime:
         )
     except ValueError as exc:
         raise ReconcileError(f"invalid GitHub UTC timestamp: {value!r}") from exc
+
+
+@dataclass(frozen=True)
+class DeadLetterAcknowledgement:
+    """One operator tombstone for a terminal downstream dead letter."""
+
+    tag: str
+    root_run_id: int
+    acknowledged_on: str
+    reason: str
+
+    def describe(self) -> str:
+        return f"{self.tag}, root {self.root_run_id}, acked {self.acknowledged_on}: {self.reason}"
+
+
+def load_acknowledgements(path: Path = ACKNOWLEDGEMENT_FILE) -> dict[str, DeadLetterAcknowledgement]:
+    """Read the committed acknowledgement store, or fail closed.
+
+    A missing, unreadable, or malformed store is a hard error and never an empty
+    acknowledgement set.  Degrading to "nothing is acknowledged" would silently
+    restore the ~650 identical ``::warning::`` lines this file exists to remove,
+    and the store would rot without anyone noticing; degrading the other way
+    would hide a genuinely new dead letter.  Neither is acceptable, so the
+    reconciler refuses to run on a store it cannot parse.
+    """
+    try:
+        value = read_json(path)
+    except ContractError as exc:
+        raise ReconcileError(f"cannot read {path.name}: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {"schema_version", "acknowledged"}:
+        raise ReconcileError(f"{path.name} must be an object of {{schema_version,acknowledged}}")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != ACKNOWLEDGEMENT_SCHEMA_VERSION
+    ):
+        raise ReconcileError(f"unsupported {path.name} schema_version")
+    if not isinstance(value["acknowledged"], list):
+        raise ReconcileError(f"{path.name} acknowledged must be a list")
+    result: dict[str, DeadLetterAcknowledgement] = {}
+    for index, entry in enumerate(value["acknowledged"]):
+        where = f"{path.name} entry {index}"
+        if not isinstance(entry, dict) or set(entry) != ACKNOWLEDGEMENT_KEYS:
+            raise ReconcileError(
+                f"{where} must be an object of {{tag,root_run_id,acknowledged_on,reason}}"
+            )
+        tag = entry["tag"]
+        if not isinstance(tag, str) or not TAG_RE.fullmatch(tag):
+            raise ReconcileError(f"{where} tag is not an immutable release tag")
+        try:
+            root_run_id = require_int(entry["root_run_id"], "root_run_id")
+        except ContractError as exc:
+            raise ReconcileError(f"{where} ({tag}): {exc}") from exc
+        acknowledged_on = entry["acknowledged_on"]
+        if not isinstance(acknowledged_on, str) or not ACKNOWLEDGEMENT_DATE_RE.fullmatch(
+            acknowledged_on
+        ):
+            raise ReconcileError(f"{where} ({tag}): acknowledged_on must be YYYY-MM-DD")
+        try:
+            dt.date.fromisoformat(acknowledged_on)
+        except ValueError as exc:
+            raise ReconcileError(f"{where} ({tag}): acknowledged_on is not a real date") from exc
+        reason = entry["reason"]
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or "\n" in reason
+            or "\r" in reason
+        ):
+            raise ReconcileError(f"{where} ({tag}): reason must be one non-empty line")
+        if tag in result:
+            raise ReconcileError(f"{path.name} acknowledges {tag} more than once")
+        result[tag] = DeadLetterAcknowledgement(tag, root_run_id, acknowledged_on, reason)
+    return result
 
 
 @dataclass(frozen=True)
@@ -333,11 +422,57 @@ def reconcile_one(source_repo: str, release: ReleaseIntent, runs: dict[str, list
         return "complete"
     if run["attempt"] >= MAX_RERUN_ATTEMPTS:
         raise ExhaustedIntent(
-            f"root {run['id']} exhausted {MAX_RERUN_ATTEMPTS} attempts ({conclusion})"
+            f"root {run['id']} exhausted {MAX_RERUN_ATTEMPTS} attempts ({conclusion})",
+            run["id"],
         )
     verify_local_release(source_repo, release)
     gh_lines(["run", "rerun", str(run["id"]), "-R", TARGET_REPO])
     return f"rerun:{run['attempt'] + 1}"
+
+
+def report_scan(
+    acknowledgements: dict[str, DeadLetterAcknowledgement],
+    acknowledged: list[DeadLetterAcknowledgement],
+    counts: dict[str, int],
+    new_dead_letters: int,
+    failures: list[str],
+) -> None:
+    """Close a full-store scan with one acknowledgement line and one summary.
+
+    Only the scheduled full scan reports this; an operator run targeting one
+    exact tag still gets that tag's own hard failure and nothing else.
+    """
+    if acknowledged:
+        noun = "dead letter" if len(acknowledged) == 1 else "dead letters"
+        detail = "; ".join(entry.describe() for entry in acknowledged)
+        print(f"::notice::{len(acknowledged)} acknowledged terminal {noun} ({detail})")
+    if not failures:
+        # A transient API failure on one release also leaves its acknowledgement
+        # unmatched.  Reporting it as stale then tells an operator to delete a
+        # perfectly good tombstone, so only a clean scan may call one stale.
+        matched = {entry.tag for entry in acknowledged}
+        for tag in sorted(set(acknowledgements) - matched):
+            entry = acknowledgements[tag]
+            # Says "matched no terminal dead letter", not "is not one": the same
+            # tag may well be terminal in this scan under a *different* root, in
+            # which case the entry needs its root_run_id corrected rather than
+            # deleted.  Both repairs are covered by "update or drop".
+            print(
+                f"::warning::stale acknowledgement: {tag} (root {entry.root_run_id}, "
+                f"acked {entry.acknowledged_on}) matched no terminal dead letter in "
+                f"this scan; update or drop it in {ACKNOWLEDGEMENT_FILE.name}"
+            )
+    parts = [f"complete={counts.get('complete', 0)}"]
+    for name in ("dispatched", "active", "rerun"):
+        if counts.get(name):
+            parts.append(f"{name}={counts[name]}")
+    if failures:
+        parts.append(f"failed={len(failures)}")
+    terminal = len(acknowledged) + new_dead_letters
+    parts.append(
+        f"terminal={terminal} (acknowledged={len(acknowledged)}, new={new_dead_letters})"
+    )
+    print("downstream reconciliation summary: " + " ".join(parts))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -346,16 +481,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", default="")
     args = parser.parse_args(argv)
     try:
+        # Parsed before the first API call so a broken store fails fast, and so
+        # a scan can never reach the dead-letter branch without knowing what an
+        # operator has already acknowledged.
+        acknowledgements = load_acknowledgements()
         releases = published_intents(args.source_repo, args.tag)
         if not releases:
             print("no published downstream intents")
             return 0
         runs = target_runs()
         failures = []
+        counts: dict[str, int] = {}
+        acknowledged: list[DeadLetterAcknowledgement] = []
+        new_dead_letters = 0
         for release in releases:
             try:
                 result = reconcile_one(args.source_repo, release, runs)
                 print(f"{release.tag}: {result}")
+                bucket = result.split(":", 1)[0]
+                counts[bucket] = counts.get(bucket, 0) + 1
             except ExhaustedIntent as exc:
                 # A scheduled full-store scan has already reported this root's
                 # bounded failures through the root runs themselves.  Treat it
@@ -365,11 +509,21 @@ def main(argv: list[str] | None = None) -> int:
                 if args.tag:
                     failures.append(f"{release.tag}: {exc}")
                     print(f"::error::{release.tag}: {exc}", file=sys.stderr)
+                    continue
+                entry = acknowledgements.get(release.tag)
+                # Exact identity, never a prefix: the tombstone is bound to the
+                # one root that went terminal, so a different root under the
+                # same tag stays a new dead letter and keeps its ::warning::.
+                if entry is not None and entry.root_run_id == exc.root_run_id:
+                    acknowledged.append(entry)
                 else:
+                    new_dead_letters += 1
                     print(f"::warning::{release.tag}: terminal dead letter: {exc}")
             except (ContractError, ReconcileError, OSError) as exc:
                 failures.append(f"{release.tag}: {exc}")
                 print(f"::error::{release.tag}: {exc}", file=sys.stderr)
+        if not args.tag:
+            report_scan(acknowledgements, acknowledged, counts, new_dead_letters, failures)
         if failures:
             raise ReconcileError(f"{len(failures)} downstream intent(s) failed reconciliation")
         return 0

@@ -75,7 +75,7 @@ jobs:
       - name: Validate release tooling
         run: |
           python3 -m pip install --quiet requests beautifulsoup4 pyluach tzdata
-          python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_resolve_release_chain_head.py test_release_workflow_contract.py test_post_to_forum.py test_export_accounting.py
+          python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_dead_letter_acknowledgements.py test_resolve_release_chain_head.py test_release_workflow_contract.py test_post_to_forum.py test_export_accounting.py
 
       - name: Validate optional orchestration identity
         env:

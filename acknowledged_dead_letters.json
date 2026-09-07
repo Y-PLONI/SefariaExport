@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "acknowledged": [
+    {
+      "tag": "2026-07-30_18-55-30558924132-1",
+      "root_run_id": 30562807099,
+      "acknowledged_on": "2026-09-07",
+      "reason": "Root 30562807099 finished completed/failure on attempt 3 of 3 and can never clear; the export was superseded 76 minutes later by release 2026-07-30_20-09-30564612136-1, whose root 30568505719 succeeded, and by every downstream root since. The release and its intent stay published and untouched."
+    }
+  ]
+}

@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate reconciler contracts
-        run: python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_release_workflow_contract.py
+        run: python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_dead_letter_acknowledgements.py test_release_workflow_contract.py
 
       - name: Reconcile all durable release intents
         shell: bash

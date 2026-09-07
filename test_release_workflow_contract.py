@@ -126,6 +126,20 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertIn("python3 reconcile_downstream.py", workflow)
         self.assertIn("secrets.PIPELINE_TOKEN", workflow)
 
+    def test_dead_letter_acknowledgements_are_gated_wherever_the_reconciler_runs(self):
+        """The store is read on both call sites, and it fails closed, so the
+        gate that proves it parses has to precede the reconciler in both."""
+        root = Path(__file__).resolve().parent
+        self.assertTrue((root / "acknowledged_dead_letters.json").is_file())
+        for relative in (".github/workflows/release.yml", ".github/workflows/reconcile-downstream.yml"):
+            workflow = (root / relative).read_text(encoding="utf-8")
+            self.assertIn("test_dead_letter_acknowledgements.py", workflow, relative)
+            self.assertLess(
+                workflow.index("test_dead_letter_acknowledgements.py"),
+                workflow.index("python3 reconcile_downstream.py"),
+                relative,
+            )
+
     def test_weekly_dispatch_has_an_exact_adoptable_identity(self):
         root = Path(__file__).resolve().parent
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
