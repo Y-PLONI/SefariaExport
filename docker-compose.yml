@@ -19,6 +19,11 @@ services:
       retries: 20
 
   exporter:
+    # Named so the release workflow can build this image once through BuildKit
+    # with a reusable layer cache and have `up` reuse it; a bare
+    # `docker compose up` still builds it from the same Dockerfile when the tag
+    # is not present locally.
+    image: sefaria-exporter:local
     build:
       context: .
       dockerfile: Dockerfile

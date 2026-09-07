@@ -31,7 +31,7 @@ jobs:
       REQUESTED_TAG: ${{ inputs.tag }}
     steps:
       - name: Checkout exact reconciler
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
           clean: true

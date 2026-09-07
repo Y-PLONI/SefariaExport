@@ -56,7 +56,7 @@ jobs:
           swap-storage: true
 
       - name: Checkout exact exporter commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
           clean: true
@@ -115,10 +115,28 @@ jobs:
           echo "tag=$previous_tag" >> "$GITHUB_OUTPUT"
           echo "metadata_sha256=$metadata_sha" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the exporter image with a shared layer cache
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          # Tagged and loaded so the compose step below reuses this exact image
+          # instead of building its own.
+          tags: sefaria-exporter:local
+          load: true
+          # Without a cache every weekly rebuilds the whole image from scratch,
+          # so one hiccup on any package host costs the entire cycle.  A failure
+          # of the cache service itself must never do that, hence ignore-error.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
       - name: Run export pipeline via Docker Compose
         env:
           TS_STAMP: ${{ steps.release.outputs.tag }}
-        run: docker compose up --build --abort-on-container-exit
+        run: docker compose up --abort-on-container-exit
 
       - name: Stop and clean up containers
         if: always()

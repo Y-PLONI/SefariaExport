@@ -34,6 +34,22 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         self.assertNotIn("jlumbroso/free-disk-space@main", workflow)
 
+    def test_export_image_is_built_once_against_a_reusable_layer_cache(self):
+        root = Path(__file__).resolve().parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("cache-from: type=gha", workflow)
+        # The cached build and the compose run have to name the same image, or
+        # `up` silently rebuilds everything the cached build just produced.
+        self.assertIn("tags: sefaria-exporter:local", workflow)
+        self.assertIn("image: sefaria-exporter:local", compose)
+        # setup-buildx-action gives buildx the docker-container driver, which
+        # keeps the result out of the local daemon unless it is loaded back —
+        # without this line `up` rebuilds the image the cached build produced.
+        self.assertIn("load: true", workflow)
+        self.assertIn("run: docker compose up --abort-on-container-exit", workflow)
+        self.assertNotIn("docker compose up --build", workflow)
+
     def test_initial_baseline_skips_only_the_downstream_dispatch(self):
         root = Path(__file__).resolve().parent
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
