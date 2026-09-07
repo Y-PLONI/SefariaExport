@@ -51,7 +51,17 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: true
+          # `large-packages` is the apt-remove pass, and it is the single
+          # noisiest thing in this job's first 90 seconds: 1,352 log lines, of
+          # which 882 are `Package 'php-...' is not installed, so not removed`.
+          # It buys 4.4 GiB of the 30 GiB this step frees, and the job does not
+          # need them.  Measured on run 33987734987: the runner starts at 59G
+          # used of 145G; this step took it to 29G; peak during the export was
+          # 42G (dump restore + 4.4G of exports + the 510M archive + the image).
+          # So the job's own footprint is ~13G, and dropping large-packages
+          # still leaves ~99G free at the peak (103G measured, minus the 4.4G
+          # this pass used to reclaim).
+          large-packages: false
           docker-images: false
           swap-storage: true
 
@@ -65,7 +75,7 @@ jobs:
       - name: Validate release tooling
         run: |
           python3 -m pip install --quiet requests beautifulsoup4 pyluach tzdata
-          python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_resolve_release_chain_head.py test_release_workflow_contract.py test_post_to_forum.py
+          python3 -m unittest -v test_link_visibility.py test_release_contract.py test_downstream_intent.py test_reconcile_downstream.py test_resolve_release_chain_head.py test_release_workflow_contract.py test_post_to_forum.py test_export_accounting.py
 
       - name: Validate optional orchestration identity
         env:
@@ -134,9 +144,47 @@ jobs:
           cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Run export pipeline via Docker Compose
+        id: export
         env:
           TS_STAMP: ${{ steps.release.outputs.tag }}
-        run: docker compose up --abort-on-container-exit
+        # `--no-attach mongodb` keeps mongod's stdout out of the job log.  In
+        # run 33987734987 that stream was 6,294 lines and 2.51 MB — 54% of all
+        # the bytes in a 4.4 MB log — and 2,208 of those lines were emitted
+        # *after* the database had been dropped, while zstd compressed for 20
+        # minutes.  `--abort-on-container-exit` is unaffected: it watches
+        # container exits, not attached streams.  Nothing is lost: the step
+        # below replays every mongod line at severity W/E/F.
+        run: docker compose up --abort-on-container-exit --no-attach mongodb
+
+      - name: Replay every mongod warning and error
+        if: always()
+        shell: bash
+        # Best-effort diagnostics only: the step must never turn a green job red
+        # on its own.  `shell: bash` means GitHub runs this as
+        # `bash --noprofile --norc -eo pipefail`, so errexit AND pipefail are on
+        # unless they are turned off right here — and `grep` with no match exits
+        # 1, which is the *normal* case for a clean run.  Without the two `set +`
+        # lines this step fails whenever mongod logged nothing at W/E/F, and also
+        # whenever `if: always()` runs it after a failure that left no container.
+        run: |
+          set -u
+          set +e
+          set +o pipefail
+          mongod_log() { docker compose logs --no-color --no-log-prefix mongodb 2>/dev/null; }
+          echo "mongod emitted $(mongod_log | wc -l) log line(s); the informational ones stay out of this log."
+          serious="$(mongod_log | grep -E '"s":"(W|E|F)"' || true)"
+          if [ -n "$serious" ]; then
+            printf '%s\n' "$serious"
+          else
+            echo "No mongod warnings or errors."
+          fi
+          # When the export itself failed, mongod's tail is the first place to
+          # look, so print it rather than making someone re-run the weekly.
+          if [ "${{ steps.export.outcome }}" != "success" ]; then
+            echo "--- last 100 mongod lines (export step: ${{ steps.export.outcome }}) ---"
+            mongod_log | tail -n 100 || true
+          fi
+          exit 0
 
       - name: Stop and clean up containers
         if: always()

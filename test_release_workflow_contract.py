@@ -34,6 +34,49 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         self.assertNotIn("jlumbroso/free-disk-space@main", workflow)
 
+    def test_the_apt_remove_pass_stays_off(self):
+        """`large-packages` freed 4.4 GiB the job never needs and cost 1,352 log
+        lines, 882 of them `Package 'php-...' is not installed, so not removed`.
+        Peak disk during run 33987734987 was 42G of 145G."""
+        root = Path(__file__).resolve().parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("large-packages: false", workflow)
+        self.assertNotIn("large-packages: true", workflow)
+
+    def test_mongod_is_quiet_and_never_streamed_into_the_job_log(self):
+        """6,294 mongod lines / 2.51 MB — 54% of the bytes of run 33987734987 —
+        and 2,208 of them were emitted after the DB was dropped, during zstd."""
+        root = Path(__file__).resolve().parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('"mongod", "--quiet"', compose)
+        self.assertIn("docker compose up --abort-on-container-exit --no-attach mongodb",
+                      workflow)
+
+    def test_mongod_warnings_and_errors_are_replayed_before_teardown(self):
+        """Cutting the stream must never cut the diagnostics with it."""
+        root = Path(__file__).resolve().parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        replay = "- name: Replay every mongod warning and error"
+        self.assertIn(replay, workflow)
+        self.assertIn('grep -E \'"s":"(W|E|F)"\'', workflow)
+        # It has to read the container logs while the container still exists.
+        self.assertLess(workflow.index(replay),
+                        workflow.index("- name: Stop and clean up containers"))
+
+    def test_the_mongod_replay_step_cannot_redden_a_green_job(self):
+        """`shell: bash` is `bash --noprofile --norc -eo pipefail`, so errexit and
+        pipefail are ON.  A clean run has no W/E/F lines, `grep` then exits 1, and
+        without these guards a diagnostics step fails the whole weekly."""
+        root = Path(__file__).resolve().parent
+        workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        start = workflow.index("- name: Replay every mongod warning and error")
+        step = workflow[start:workflow.index("- name: Stop and clean up containers")]
+        self.assertIn("set +e", step)
+        self.assertIn("set +o pipefail", step)
+        self.assertIn('grep -E \'"s":"(W|E|F)"\' || true', step)
+        self.assertIn("exit 0", step)
+
     def test_export_image_is_built_once_against_a_reusable_layer_cache(self):
         root = Path(__file__).resolve().parent
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
