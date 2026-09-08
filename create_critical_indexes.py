@@ -13,6 +13,7 @@ Sefaria adds later without having to hand-maintain a parallel list.
 """
 import os
 import sys
+import time
 
 
 def main() -> int:
@@ -28,9 +29,16 @@ def main() -> int:
 
     from sefaria.system.database import ensure_indices
 
-    print("🔧 Running sefaria.system.database.ensure_indices() ...")
+    # This is the longest silent stretch in the whole job: 388s in run
+    # 33987734987 (19:47:03 -> 19:53:31) with not one line between these two
+    # prints.  ensure_indices() is upstream and gives no callback, so the least
+    # we can do is say how long it took, and how far into the job that puts us.
+    print("🔧 Running sefaria.system.database.ensure_indices() "
+          "(~6-7 min, no output until it finishes) ...", flush=True)
+    started = time.monotonic()
     ensure_indices()
-    print("✅ All Sefaria indexes ensured.")
+    elapsed = time.monotonic() - started
+    print(f"✅ All Sefaria indexes ensured in {elapsed:.0f}s.", flush=True)
     return 0
 
 

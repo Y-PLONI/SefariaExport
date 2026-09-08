@@ -34,14 +34,20 @@ mongorestore \
 echo "✅ Data restore completed."
 
 echo ""
-echo "🔎 Checking mongorestore capabilities..."
+# No released mongodb-database-tools carries a `--metadataOnly` flag — 100.9.4,
+# the version this image pins, included — so this probe has been false on every
+# run and the branches behind it have never executed.  It stays because it is
+# the only thing that would notice the flag arriving, but it is an ℹ️ and not a
+# ⚠️: the indexes come from ensure_indices() (create_critical_indexes.py, below)
+# either way, and a warning that fires unconditionally only trains people to
+# skip warnings.
 MONGORESTORE_HELP=$(mongorestore --help 2>&1 || true)
 if echo "$MONGORESTORE_HELP" | grep -q -- "--metadataOnly"; then
   HAS_METADATA_ONLY=1
   echo "✅ mongorestore supports --metadataOnly"
 else
   HAS_METADATA_ONLY=0
-  echo "⚠️  mongorestore does NOT support --metadataOnly on this machine."
+  echo "ℹ️  mongorestore has no --metadataOnly flag (expected); indexes come from ensure_indices()."
 fi
 
 # Phase 2: Optionally restore metadata (indexes) with exclusions to avoid timeouts on heavy collections
@@ -57,8 +63,8 @@ case "${RESTORE_INDEXES_MODE}" in
         "mongo_dump_pkg/sefaria"
       echo "✅ Index metadata restored for all collections."
     else
-      echo "ℹ️  Falling back: skipping metadata restore because --metadataOnly is unavailable."
-      echo "    To attempt index creation from dump metadata.json, set ENABLE_INDEXES_FROM_METADATA=true"
+      echo "ℹ️  No metadata restore (see above); ensure_indices() will build the indexes."
+      echo "    To build them from the dump's own metadata.json instead, set ENABLE_INDEXES_FROM_METADATA=true"
     fi
     ;;
   skip_links)
@@ -73,8 +79,8 @@ case "${RESTORE_INDEXES_MODE}" in
         "mongo_dump_pkg/sefaria"
       echo "✅ Index metadata restored (links collection skipped)."
     else
-      echo "ℹ️  Falling back: skipping metadata restore because --metadataOnly is unavailable."
-      echo "    To attempt index creation from dump metadata.json (excluding links), set ENABLE_INDEXES_FROM_METADATA=true"
+      echo "ℹ️  No metadata restore (see above); ensure_indices() will build the indexes."
+      echo "    To build them from the dump's own metadata.json (excluding links) instead, set ENABLE_INDEXES_FROM_METADATA=true"
     fi
     ;;
   none)

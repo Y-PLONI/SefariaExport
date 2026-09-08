@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The forum client is imported by test_post_to_forum.py, so its runtime
       # dependencies have to exist before the suite runs.

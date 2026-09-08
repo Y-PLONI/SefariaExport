@@ -6,8 +6,18 @@ services:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
-    # Constrain MongoDB memory to prevent OOM kills
-    command: ["mongod", "--wiredTigerCacheSizeGB", "2.5"]
+    # Constrain MongoDB memory to prevent OOM kills.
+    #
+    # `--quiet` trims mongod's per-connection NETWORK chatter.  mongod documents
+    # it as suppressing database-command output, replication activity and
+    # connection accepted/closed events — 2,578 of the 6,286 mongod lines in run
+    # 33987734987.  The 1,288 `"msg":"client metadata"` lines are NOT on that
+    # documented list, so treat `--quiet` as a partial measure: what actually
+    # keeps mongod out of the job log is `--no-attach mongodb` in release.yml.
+    # `--quiet` suppresses nothing at severity W/E/F, and the release workflow
+    # replays those separately after the run — this cuts duplication, not
+    # diagnostics.
+    command: ["mongod", "--quiet", "--wiredTigerCacheSizeGB", "2.5"]
     deploy:
       resources:
         limits:
@@ -19,6 +29,11 @@ services:
       retries: 20
 
   exporter:
+    # Named so the release workflow can build this image once through BuildKit
+    # with a reusable layer cache and have `up` reuse it; a bare
+    # `docker compose up` still builds it from the same Dockerfile when the tag
+    # is not present locally.
+    image: sefaria-exporter:local
     build:
       context: .
       dockerfile: Dockerfile

@@ -5,7 +5,10 @@ forum refused the second one ("ניתן לפרסם פוסט רק פעם ב-1 ש�
 script printed "✅ Posted" for that refusal — so every "new books" post was
 lost silently for eleven consecutive releases.
 """
+import contextlib
+import io
 import json
+import sys
 import tempfile
 import unittest
 from datetime import date
@@ -42,6 +45,18 @@ class SendPostsTest(unittest.TestCase):
         patcher = mock.patch.object(post_to_forum.time, "sleep")
         self.sleep = patcher.start()
         self.addCleanup(patcher.stop)
+        # send_posts narrates every refusal with ❌ and every retry with ⏳.
+        # Left loose, those 19 lines land in the release job's "Validate release
+        # tooling" step, so anyone grepping the weekly log for ❌ hits a false
+        # positive on a passing test suite (audit of run 33987734987, §4).
+        # Captured, not silenced: the assertions below read the buffer.
+        self.stdout = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.stdout)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def output(self):
+        return self.stdout.getvalue()
 
     def test_every_post_lands_when_the_forum_accepts(self):
         client = FakeClient([ok(1), ok(2)])
@@ -68,6 +83,8 @@ class SendPostsTest(unittest.TestCase):
         self.assertEqual([], failed)
         self.assertEqual(3, len(client.calls))
         self.assertEqual(1994, client.calls[-1][0])
+        self.assertIn("⏳", self.output())
+        self.assertNotIn("❌", self.output())
 
     def test_backoff_grows_between_retries(self):
         client = FakeClient([
@@ -84,6 +101,7 @@ class SendPostsTest(unittest.TestCase):
             client, [("ספרים חדשים", 1994, "x")], delay=1, attempts=3)
         self.assertEqual(["ספרים חדשים"], failed)
         self.assertEqual(3, len(client.calls))
+        self.assertIn("❌ Forum post NOT created for ספרים חדשים", self.output())
 
     def test_non_rate_limit_refusal_is_not_retried(self):
         client = FakeClient([ForumPostError("forbidden", "no-privileges")])
@@ -97,6 +115,14 @@ class SendPostsTest(unittest.TestCase):
         failed = post_to_forum.send_posts(client, [("a", 1994, "x")], delay=1, attempts=4)
         self.assertEqual(["a"], failed)
         self.assertEqual(1, len(client.calls))
+        self.assertIn("undetermined outcome", self.output())
+
+    def test_every_line_this_class_prints_stays_out_of_the_ci_log(self):
+        """The capture above is the fix; this is what proves it still holds."""
+        self.assertIs(sys.stdout, self.stdout, "setUp must own stdout for every test here")
+        client = FakeClient([ok(1)])
+        post_to_forum.send_posts(client, [("a", 1617, "x")], delay=1, attempts=1)
+        self.assertIn("✅ Posted to forum topic 1617", self.output())
 
     def test_one_failure_does_not_stop_the_remaining_posts(self):
         client = FakeClient([ForumPostError("forbidden", "no"), ok(2)])

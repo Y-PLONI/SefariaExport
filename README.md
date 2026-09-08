@@ -28,7 +28,7 @@ Prerequisites (local)
 You can run the pipeline on Linux or macOS. The GitHub Actions workflow shows a fully automated reference run. For a local run, install or ensure access to:
 
 - Bash and coreutils
-- Python 3.9 (to mirror CI) with `pip`
+- Python 3.12 (to mirror CI) with `pip`
 - Git, curl, unzip, jq
 - MongoDB Database Tools (for `mongorestore`)
 - A running MongoDB instance on `localhost:27017`
@@ -126,7 +126,7 @@ Environment variables
 ---------------------
 Some scripts accept environment variables to tweak behavior. Common ones include:
 
-- `PYTHON_VERSION` – Pin a Python version (the CI uses 3.9)
+- `PYTHON_VERSION` – Pin a Python version (the CI uses 3.12)
 - `MONGODB_URI` – Override the default MongoDB connection string (e.g., `mongodb://localhost:27017`)
 - `GITHUB_TOKEN` – Personal Access Token with `repo` scope, required for release steps when running locally
 - `RELEASE_TAG` / `RELEASE_NAME` – Override the computed tag/name for releases

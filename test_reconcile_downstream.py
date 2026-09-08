@@ -142,11 +142,16 @@ class ReconcileDownstreamTest(unittest.TestCase):
         self.assertEqual("complete", result)
         verify.assert_not_called()
 
+    @mock.patch.object(reconciler, "load_acknowledgements", return_value={})
     @mock.patch.object(reconciler, "target_runs")
     @mock.patch.object(reconciler, "published_intents")
     def test_full_scan_dead_letters_exhausted_but_exact_tag_fails(
-        self, published_intents, target_runs
+        self, published_intents, target_runs, load_acknowledgements
     ):
+        # Empty store on purpose: with the committed one this scan would also
+        # print a *stale* acknowledgement warning, whose text contains "terminal
+        # dead letter" too, and the assertion below would stop distinguishing
+        # the unacknowledged-dead-letter path it exists to guard.
         release = self.release()
         failed = self.root_run(conclusion="failure", attempt=3)
         published_intents.return_value = [release]
@@ -157,7 +162,11 @@ class ReconcileDownstreamTest(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             result = reconciler.main(["--source-repo", "Otzaria/SefariaExport"])
         self.assertEqual(0, result)
-        self.assertIn("terminal dead letter", stdout.getvalue())
+        self.assertIn(
+            f"::warning::{release.tag}: terminal dead letter: "
+            "root 987 exhausted 3 attempts (failure)",
+            stdout.getvalue(),
+        )
         self.assertEqual("", stderr.getvalue())
 
         stdout = io.StringIO()
